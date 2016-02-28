@@ -16,6 +16,7 @@ from juju_okeanos.constraints import init
 from kamaki.cli.config import Config
 from base64 import b64encode
 from time import sleep
+import subprocess
 
 log = logging.getLogger("juju.okeanos")
 
@@ -72,6 +73,24 @@ class Okeanos(object):
             raise ConfigError("Wrong okeanos configuration")
         return okeanos_config
 
+    def remote_run(self, vm, command, env=None, capture_err=False):
+        if env is None:
+            env = dict(os.environ)
+        
+        args = ['ssh', '-oStrictHostKeyChecking=no', 'root@{}'.format(vm['fqdn'])]
+        args.extend(command)
+        log.debug("Running juju command: %s", " ".join(args))
+        try:
+            if capture_err:
+                return subprocess.check_call(
+                    args, env=env, stderr=subprocess.STDOUT)
+            return subprocess.check_output(
+                args, env=env, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError, e:
+            log.error(
+                "Failed to run command %s\n%s",
+                ' '.join(args), e.output)
+            raise
 
     def get_image_client(self):
         astakos = AstakosClient(self.endpoints['astakos'], self.auth_token)
@@ -94,21 +113,77 @@ class Okeanos(object):
     def get_identity_client(self):
         return AstakosClient(self.endpoints['astakos'], self.auth_token)
 
-    def add_private_network(self):
+    def add_private_network(self, recreate=True):
+        existing_net = self.get_private_network()
+        if not recreate and existing_net:
+            return existing_net
+ 
+        # if get_private_network():
+        #     clean network
         project = self.get_project_id()
         network = self.get_network_client()
         net = network.create_network(type='MAC_FILTERED', name='Juju-okeanos private network', project_id=project)
-        network.create_subnet(net['id'], '192.168.1.0/24' , gateway_ip='192.168.1.1', 
-                              allocation_pools={"start": "192.168.1.2", "end": "192.168.1.254"},  enable_dhcp=True)
+        network.create_subnet(net['id'], '192.168.1.0/24')
+        #network.create_subnet(net['id'], '192.168.1.0/24' , gateway_ip='192.168.1.1', 
+        #                      allocation_pools={"start": "192.168.1.2", "end": "192.168.1.254"},  enable_dhcp=True)
+        sleep(10)
         return net
 
-    def add_public_network(self):
-        pass
+    def get_private_network(self):
+        network = self.get_network_client()
+        for net in network.list_networks(detail=True):
+            if not net['public'] and net['name'] == 'Juju-okeanos private network':
+                return net
 
-    def attach_network_to_machine(self, net, vm):
+        return None
+
+    def attach_private_ip_to_machine(self, net, vm):
         project = self.get_project_id()
         network = self.get_network_client()
-        network.create_port(net['id'], vm['id'])
+        port = network.create_port(net['id'], vm['id'])
+        print("****** Private port for vm  with id {} *******".format(vm['id']))
+        print(port)
+        print("****** port *******")
+        port['status'] = network.wait_port(port['id'], port['status'])
+        sleep(10)
+        return port
+
+    def attach_public_ip_to_machine(self, vm):
+        project = self.get_project_id()
+        network = self.get_network_client()
+        ip = network.create_floatingip(project_id=project)
+        print('Reserved new IP {}'.format(ip['floating_ip_address']))
+        port = network.create_port(
+                   network_id=ip['floating_network_id'],
+                   device_id=vm['id'],
+                   fixed_ips=[dict(ip_address=ip['floating_ip_address']), ])
+        print("****** Public port for vm  with id {} *******".format(vm['id']))
+        print(port)
+        print("****** port *******")
+        port['status'] = network.wait_port(port['id'], port['status'])
+        sleep(10)
+        return port
+
+    def set_internal_gw(self, vm):
+        self.remote_run(vm, ["route del default"])
+        # get this from param
+        # make this permanent
+        sleep(10)
+        self.remote_run(vm, ["route add default gw 192.168.1.2 eth1"])
+        sleep(10)
+
+    def set_nat(self, vm):
+        self.remote_run(vm, ["echo 1 > /proc/sys/net/ipv4/ip_forward"])
+        sleep(10)
+        self.remote_run(vm, ["iptables -F"])
+        sleep(10)
+        self.remote_run(vm, ["iptables -t nat -F"])
+        sleep(10)
+        # get this from param
+        # make this permanent
+        self.remote_run(vm, ["iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE"])
+        sleep(10)
+
 
     def add_machine(self, params, private_net=None, is_gateway=False, public_net=None):
         print(self.config)
@@ -138,8 +213,7 @@ class Okeanos(object):
         
         networks = []
         if private_net:
-            net_specs = {'uuid':private_net['id']}
-            networks.append(net_specs)
+            networks.append({'uuid':private_net['id']})
         if public_net:
             networks.append({'uuid':public_net['id']})
 
@@ -154,7 +228,7 @@ class Okeanos(object):
         print("Waiting for server....")    
         compute_client.wait_server(srv['id'], srv['status'])
 
-        conn_info = dict(id=srv['SNF:fqdn'], ip_address=[])
+        conn_info = dict(fqdn=srv['SNF:fqdn'], ip_address=[], id=srv['id'])
         nics = compute_client.get_server_nics(srv['id'])
         for port in nics['attachments']:
             if port['ipv4']:

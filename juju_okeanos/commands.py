@@ -76,17 +76,20 @@ class Bootstrap(BaseCommand):
         log.info("Launching bootstrap host (eta 5m)...")        
         params = dict(
             name="%s-0" % self.config.get_env_name())
-        net = self.provider.add_private_network()
-        print(net)
-        instance = self.provider.add_machine(params, private_net=net, is_gateway=True)
+        net = self.provider.add_private_network(recreate=False)
+        instance = self.provider.add_machine(params)
+        self.provider.attach_public_ip_to_machine(instance)
+        self.provider.attach_private_ip_to_machine(net, instance)
+        self.provider.set_nat(instance)
 
         log.info("Bootstrapping environment...")
         try:
-            self.env.bootstrap_jenv(instance['id'])
+            self.env.bootstrap_jenv(instance['fqdn'])
         except:
             self.provider.terminate_instance(instance['id'])
             raise
         log.info("Bootstrap complete.")
+        
 
     def check_preconditions(self):
         result = super(Bootstrap, self).check_preconditions()
@@ -146,17 +149,20 @@ class AddMachine(BaseCommand):
         #op_class = self.provider.version == 2.0 and \
         #    ops.MachineUserDataRegister or ops.MachineRegister
 
+        net = self.provider.get_private_network()
         for n in range(self.config.num_machines):
             machine_name="%s-%s" % (self.config.get_env_name(), uuid.uuid4().hex)
             params = dict(
                       name=machine_name
                      )
 
-            instance = self.provider.add_machine(params)
-            self.env.add_machine("ssh:root@%s" % instance['ip_address'][0])
+            # This should be flagged in case we use only ipv6
+            instance = self.provider.add_machine(params, private_net=net)
+            self.provider.set_internal_gw(instance)
+            self.env.add_machine("ssh:root@%s" % instance['fqdn'])
             # TODO if the above fail kill the machine.
             log.info("Registered id:%s name:%s %s as juju machine",
-                     instance['id'], machine_name, instance['ip_address'][0])
+                     instance['fqdn'], machine_name, instance['ip_address'][0])
 
 
 class TerminateMachine(BaseCommand):
